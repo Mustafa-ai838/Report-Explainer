@@ -70,7 +70,8 @@ function header() {
           <button type="button" data-language="ur" aria-pressed="${state.language === "ur"}">${text("language.urdu")}</button>
         </div>
         ${simple ? "" : state.report
-          ? `<a class="button primary small" href="#upload" data-page="upload">${text("nav.upload")}</a>`
+          ? `<a class="button primary small" href="#upload" data-page="upload">${text("nav.upload")}</a>
+             <a class="button ghost small" href="#login" data-page="login">${text("nav.login")}</a>`
           : `<a class="button ghost small" href="#login" data-page="login">${text("nav.login")}</a>`}
       </div>
     </header>`;
@@ -169,8 +170,8 @@ function loginPage() {
         <form class="form" data-form="login">
           <div class="field"><label for="email">${text("login.email")}</label><input id="email" type="email" placeholder="name@example.com" autocomplete="email" required></div>
           <div class="field"><label for="password">${text("login.password")}</label><input id="password" type="password" placeholder="At least 8 characters" autocomplete="current-password" required></div>
-          <div class="form-meta"><label class="inline-check"><input type="checkbox">${text("login.remember")}</label><a href="#forgot" data-page="forgot">${text("login.forgot")}</a></div>
-          <button class="button primary full" type="submit">${text("login.submit")}</button>
+          <div class="form-meta"><label class="inline-check" data-action="unavailable-account"><input type="checkbox">${text("login.remember")}</label><a href="#forgot" data-page="forgot">${text("login.forgot")}</a></div>
+          <button class="button primary full" type="submit" data-action="unavailable-account">${text("login.submit")}</button>
           <button class="button full" type="button" data-page="home">${text("login.guest")}</button>
           <p class="muted">${text("login.new")} <a href="#account" data-page="account">${text("login.create")}</a></p>
           <button class="button full" type="button" data-action="unavailable-account">${text("login.google")}</button>
@@ -335,18 +336,19 @@ function explanationPage() {
     return `<button type="button" data-explanation-language="${language}" aria-pressed="${state.explanationLanguage === language}">${label}</button>`;
   }).join("");
   const cards = state.results.map((row, index) => {
-    const explanation = row.needsReview || row.status === "review"
-      ? text("explanation.review")
-      : `${escapeHtml(row.name)}: ${escapeHtml(row.value)} ${escapeHtml(row.unit)} — ${escapeHtml(row.status)} (${escapeHtml(row.referenceRange)}). ${text("source.disclaimer")}`;
-    const urExplanation = row.needsReview || row.status === "review"
-      ? text("explanation.review")
-      : `${escapeHtml(row.name)}: ${escapeHtml(row.value)} ${escapeHtml(row.unit)} — ${escapeHtml(row.referenceRange)}۔ ${text("source.disclaimer")}`;
+    const needsReview = row.needsReview || row.status === "review";
+    const englishExplanation = needsReview
+      ? escapeHtml(state.translations.en["explanation.review"])
+      : `${escapeHtml(row.name)}: ${escapeHtml(row.value)} ${escapeHtml(row.unit)} — ${escapeHtml(row.status)} (${escapeHtml(row.referenceRange)}). ${escapeHtml(state.translations.en["source.disclaimer"])}`;
+    const urduExplanation = needsReview
+      ? escapeHtml(state.translations.ur["explanation.review"])
+      : `${escapeHtml(row.name)}: ${escapeHtml(row.value)} ${escapeHtml(row.unit)} — ${escapeHtml(row.referenceRange)}۔ ${escapeHtml(state.translations.ur["source.disclaimer"])}`;
     return `<article class="panel explanation-card">
       <h3>${escapeHtml(row.name)} ${statusPill(row.status)}</h3>
       <p>${text("data.value")}: <strong>${escapeHtml(row.value ?? text("common.unknown"))} ${escapeHtml(row.unit)}</strong>
         &nbsp; ${text("data.range")}: <strong>${escapeHtml(row.referenceRange)}</strong></p>
-      <p>${explanation}</p>
-      ${state.explanationLanguage !== "en" ? `<p class="urdu-copy" lang="ur" dir="rtl">${urExplanation}</p>` : ""}
+      ${state.explanationLanguage !== "ur" ? `<p class="english-copy">${englishExplanation}</p>` : ""}
+      ${state.explanationLanguage !== "en" ? `<p class="urdu-copy" lang="ur" dir="rtl">${urduExplanation}</p>` : ""}
       <a class="source-link" href="#source" data-source-index="${index}">${text("common.source")} →</a>
     </article>`;
   }).join("");
@@ -493,6 +495,10 @@ const errorText = {
     "The report server is not reachable. Check that it is running and open this app at its HTTP URL.",
     "رپورٹ سرور تک رسائی نہیں ہو رہی۔ دیکھیں کہ سرور چل رہا ہے اور ایپ HTTP لنک سے کھولیں۔"
   ],
+  pdf_no_readable_text: [
+    "This PDF has no readable text. Please upload a clear photo or screenshot of the report instead.",
+    "اس PDF میں پڑھنے کے قابل متن نہیں ہے۔ براہِ کرم اس کے بجائے رپورٹ کی صاف تصویر یا اسکرین شاٹ اپ لوڈ کریں۔"
+  ],
   storage_full: [
     "The server is out of disk space. Free space on the server drive, then try again.",
     "سرور کی ڈرائیو میں جگہ ختم ہے۔ کچھ جگہ خالی کر کے دوبارہ کوشش کریں۔"
@@ -518,8 +524,8 @@ const errorText = {
     "رپورٹ فائل منسلک نہیں ہوئی۔ فائل منتخب کر کے دوبارہ کوشش کریں۔"
   ],
   ocr_engine_unavailable: [
-    "OCR engine not found or its English data could not be loaded. Check server setup and network access.",
-    "OCR انجن دستیاب نہیں یا اس کا انگریزی ڈیٹا نہیں کھل سکا۔ سرور کی ترتیبات اور نیٹ ورک دیکھیں۔"
+    "The offline OCR engine or its English data could not be loaded. Check the app files and restart the server.",
+    "آف لائن OCR انجن یا اس کا انگریزی ڈیٹا نہیں کھل سکا۔ ایپ کی فائلیں دیکھ کر سرور دوبارہ شروع کریں۔"
   ],
   pdf_read_failed: [
     "The PDF could not be read. Try a valid, text-based PDF or a clear report photo.",
@@ -759,7 +765,7 @@ document.addEventListener("click", (event) => {
       api(`/api/reports/${encodeURIComponent(reportId)}`, { method: "DELETE" }).catch(showError);
     }
   }
-  if (action === "unavailable-account") showNotice(text("account.lede"));
+  if (action === "unavailable-account") showNotice(text("account.soon"));
 });
 
 document.addEventListener("change", (event) => {
@@ -782,7 +788,7 @@ document.addEventListener("submit", (event) => {
     saveResult(form);
   } else if (form.matches('[data-form="login"]')) {
     event.preventDefault();
-    showNotice(text("account.lede"));
+    showNotice(text("account.soon"));
   }
 });
 

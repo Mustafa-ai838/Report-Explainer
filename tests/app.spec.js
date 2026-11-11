@@ -2,46 +2,23 @@ import { test, expect } from "@playwright/test";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { inflateSync } from "node:zlib";
+import pdfParse from "pdf-parse";
 
 const fixtureDirectory = path.join(os.tmpdir(), `report-explainer-${process.pid}`);
 const fixtures = {};
 const fixtureNames = Object.fromEntries(
   ["pdf", "png", "jpg"].map((kind) => [kind, `sample-report-${process.pid}.${kind}`])
 );
+fixtureNames.scannedPdf = `scanned-report-${process.pid}.pdf`;
 const reports = {
   pdf: { marker: "PdfMarker", value: "6.7", unit: "mg/dL", range: "5.0 - 8.0" },
   png: { marker: "PngMarker", value: "7.3", unit: "mg/L", range: "3.0 - 9.0" },
   jpg: { marker: "JpgMarker", value: "8.4", unit: "mmol/L", range: "4.0 - 10.0" }
 };
 
-function extractPdfText(pdf) {
-  const source = pdf.toString("latin1");
-  if (!source.startsWith("%PDF-")) throw new Error("Downloaded file does not have a PDF signature.");
-  const startXref = Number(source.match(/startxref\r?\n(\d+)/)?.[1]);
-  if (!Number.isInteger(startXref) || source.slice(startXref, startXref + 4) !== "xref") {
-    throw new Error("Downloaded PDF has no valid cross-reference table.");
-  }
-  const xrefLines = source.slice(startXref).split(/\r?\n/);
-  const objectCount = Number(xrefLines[1]?.split(/\s+/)[1]);
-  for (let id = 1; id < objectCount; id += 1) {
-    const offset = Number(xrefLines[id + 2]?.slice(0, 10));
-    if (source.slice(offset, offset + `${id} 0 obj`.length) !== `${id} 0 obj`) {
-      throw new Error(`Downloaded PDF has an invalid cross-reference entry for object ${id}.`);
-    }
-  }
-
-  const streams = [];
-  const streamHeader = /\/Length\s+(\d+)\s*\/Filter\s*\/FlateDecode\s*>>\s*stream\r?\n/g;
-  for (const match of source.matchAll(streamHeader)) {
-    const start = match.index + match[0].length;
-    const length = Number(match[1]);
-    streams.push(inflateSync(pdf.subarray(start, start + length)).toString("latin1"));
-  }
-  if (!streams.length) throw new Error("Downloaded PDF has no readable content stream.");
-  return streams.join("\n").replace(/\[([^\]]*)\]\s*TJ/g, (_, tokens) =>
-    [...tokens.matchAll(/<([a-f\d]+)>/gi)].map((match) => Buffer.from(match[1], "hex").toString("latin1")).join("")
-  );
+async function extractPdfText(pdf) {
+  const parsed = await pdfParse(pdf);
+  return parsed.text;
 }
 
 test.beforeAll(async ({ browser }) => {
@@ -76,6 +53,10 @@ test.beforeAll(async ({ browser }) => {
     }
     fixtures[kind] = path.join(fixtureDirectory, fixtureNames[kind]);
   }
+  const image = await readFile(fixtures.png);
+  await page.setContent(`<img alt="" src="data:image/png;base64,${image.toString("base64")}">`);
+  fixtures.scannedPdf = path.join(fixtureDirectory, fixtureNames.scannedPdf);
+  await page.pdf({ path: fixtures.scannedPdf, format: "A4" });
   await page.close();
 });
 
@@ -112,6 +93,7 @@ test("accepted uploads are immediately saved in persistent History", async ({ re
     }
   });
   expect(uploadResponse.status()).toBe(201);
+  expect(uploadResponse.headers()["set-cookie"]).toMatch(/HttpOnly; SameSite=Lax/);
   const uploaded = await uploadResponse.json();
   try {
     const historyResponse = await request.get("/api/reports");
@@ -128,6 +110,40 @@ test("accepted uploads are immediately saved in persistent History", async ({ re
     const deleteResponse = await request.delete(`/api/reports/${uploaded.id}`);
     expect(deleteResponse.status()).toBe(204);
   }
+});
+
+test("reports are private to the browser guest that uploaded them", async ({ browser }) => {
+  const owner = await browser.newContext();
+  const otherGuest = await browser.newContext();
+  const uploadResponse = await owner.request.post("/api/reports", {
+    multipart: {
+      report: {
+        name: "private-report.png",
+        mimeType: "image/png",
+        buffer: await readFile(fixtures.png)
+      }
+    }
+  });
+  expect(uploadResponse.status()).toBe(201);
+  const uploaded = await uploadResponse.json();
+  try {
+    expect(await (await otherGuest.request.get("/api/reports")).json()).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: uploaded.id })])
+    );
+    expect((await otherGuest.request.get(`/api/reports/${uploaded.id}`)).status()).toBe(404);
+    expect((await otherGuest.request.get(`/api/reports/${uploaded.id}/file`)).status()).toBe(404);
+    expect((await otherGuest.request.delete(`/api/reports/${uploaded.id}`)).status()).toBe(404);
+  } finally {
+    expect((await owner.request.delete(`/api/reports/${uploaded.id}`)).status()).toBe(204);
+    await owner.close();
+    await otherGuest.close();
+  }
+});
+
+test("the public health endpoint returns ok", async ({ request }) => {
+  const response = await request.get("/health");
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toEqual({ status: "ok" });
 });
 
 test("the designed pages, navigation, translations, menus, and accordions work", async ({ page }) => {
@@ -167,14 +183,19 @@ test("the designed pages, navigation, translations, menus, and accordions work",
   await page.getByLabel("Email").fill("guest@example.com");
   await page.getByLabel("Password").fill("report-test-password");
   await page.getByRole("button", { name: "Log in" }).click();
-  await expect(page.getByRole("status")).toContainText("Accounts are not enabled");
+  await expect(page.getByRole("status")).toContainText("Accounts will be available soon");
   await page.getByRole("button", { name: "Continue with Google" }).click();
-  await expect(page.getByRole("status")).toContainText("Accounts are not enabled");
+  await expect(page.getByRole("status")).toContainText("Accounts will be available soon");
+  await page.getByRole("button", { name: "اردو" }).first().click();
+  await page.getByRole("button", { name: "Google کے ساتھ جاری رکھیں" }).click();
+  await expect(page.getByRole("status")).toContainText("اکاؤنٹس جلد دستیاب ہوں گے۔");
+  await page.getByRole("button", { name: "English" }).first().click();
   await page.getByRole("link", { name: "Forgot password?" }).click();
   await expect(page.getByRole("heading", { name: "Password help" })).toBeVisible();
   await page.getByRole("link", { name: "Back to Log in" }).click();
   await page.getByRole("link", { name: "Create an account" }).click();
   await expect(page.getByRole("heading", { name: "Create an account" })).toBeVisible();
+  await expect(page.getByText("Accounts will be available soon").first()).toBeVisible();
   await page.getByRole("link", { name: "Continue as guest" }).click();
   await expect(page.getByRole("heading", { name: "Understand your lab report in plain language" })).toBeVisible();
 
@@ -184,6 +205,26 @@ test("the designed pages, navigation, translations, menus, and accordions work",
   await page.getByRole("link", { name: "Report Explainer" }).click();
   await expect(page.getByRole("heading", { name: "Understand your lab report in plain language" })).toBeVisible();
   expect(pageErrors).toEqual([]);
+});
+
+test("scanned PDFs show a clear English and Urdu explanation", async ({ page }) => {
+  await page.goto("/#upload");
+  await page.locator("#reportFile").setInputFiles(fixtures.scannedPdf);
+  const uploadResponsePromise = page.waitForResponse((response) =>
+    response.url().endsWith("/api/reports") && response.request().method() === "POST"
+  );
+  await page.getByRole("button", { name: "Process report" }).click();
+  const uploaded = await (await uploadResponsePromise).json();
+  try {
+    await expect(page.getByRole("status")).toContainText(
+      "This PDF has no readable text. Please upload a clear photo or screenshot of the report instead."
+    );
+    await expect(page.getByRole("status")).toContainText(
+      "اس PDF میں پڑھنے کے قابل متن نہیں ہے۔ براہِ کرم اس کے بجائے رپورٹ کی صاف تصویر یا اسکرین شاٹ اپ لوڈ کریں۔"
+    );
+  } finally {
+    expect((await page.request.delete(`/api/reports/${uploaded.id}`)).status()).toBe(204);
+  }
 });
 
 test("upload errors show the actual cause in English and Urdu", async ({ page }) => {
@@ -264,8 +305,10 @@ for (const kind of ["pdf", "png", "jpg"]) {
     await expect(page.getByText(report.marker, { exact: false }).first()).toBeVisible();
     await page.locator("#view .lang-switch").getByRole("button", { name: "اردو", exact: true }).click();
     await expect(page.locator(".urdu-copy").first()).toBeVisible();
+    await expect(page.locator(".english-copy").first()).toBeHidden();
     await page.locator("#view .lang-switch").getByRole("button", { name: "Both" }).click();
     await expect(page.locator(".urdu-copy").first()).toBeVisible();
+    await expect(page.locator(".english-copy").first()).toBeVisible();
     await page.locator("#view .lang-switch").getByRole("button", { name: "English", exact: true }).click();
     await expect(page.locator(".urdu-copy")).toHaveCount(0);
 
@@ -312,7 +355,9 @@ for (const kind of ["pdf", "png", "jpg"]) {
     ]);
     expect(summaryPdfDownload.suggestedFilename()).toBe(`sample-report-${process.pid}-report.pdf`);
     const summaryPdf = await readFile(await summaryPdfDownload.path());
-    expect(extractPdfText(summaryPdf)).toContain(report.marker);
+    const summaryPdfText = await extractPdfText(summaryPdf);
+    expect(summaryPdfText).toContain(report.marker);
+    expect(summaryPdfText).not.toContain("Report Explainer build");
     const [summaryCsvDownload] = await Promise.all([
       page.waitForEvent("download"),
       page.getByRole("link", { name: "Download CSV" }).click()
@@ -366,7 +411,7 @@ for (const kind of ["pdf", "png", "jpg"]) {
       page.waitForEvent("download"),
       historyRow.getByRole("link", { name: "Download PDF" }).click()
     ]);
-    expect(extractPdfText(await readFile(await historyPdfDownload.path()))).toContain(report.marker);
+    expect(await extractPdfText(await readFile(await historyPdfDownload.path()))).toContain(report.marker);
     const [historyCsvDownload] = await Promise.all([
       page.waitForEvent("download"),
       historyRow.getByRole("link", { name: "Download CSV" }).click()

@@ -30,7 +30,6 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("PORT m
 if (process.env.GUEST_COOKIE_SECRET && Buffer.byteLength(process.env.GUEST_COOKIE_SECRET) < 32) {
   throw new Error("GUEST_COOKIE_SECRET must contain at least 32 characters.");
 }
-void userRetentionDays;
 mkdirSync(path.dirname(databasePath), { recursive: true });
 
 const db = new DatabaseSync(databasePath);
@@ -89,9 +88,9 @@ function getOrCreateGuestOwner(request, response) {
 function checkRateLimit(request, pathname, response) {
   const now = Date.now();
   const ip = request.socket.remoteAddress || "unknown";
-  const rules = [{ key: `api:${ip}`, limit: 120, window: 60_000 }];
+  const rules = [{ key: `api:${ip}`, limit: 600, window: 60_000 }];
   if (request.method === "POST" && pathname === "/api/reports") {
-    rules.push({ key: `upload:${ip}`, limit: 10, window: 60 * 60_000 });
+    rules.push({ key: `upload:${ip}`, limit: 20, window: 60 * 60_000 });
   }
 
   for (const rule of rules) {
@@ -145,8 +144,9 @@ function resolveBrowserPath() {
 function cleanExpiredGuestReports() {
   const deleted = db.prepare(`
     DELETE FROM reports
-    WHERE owner_id LIKE 'guest:%' AND datetime(created_at) < datetime('now', ?)
-  `).run(`-${guestRetentionHours} hours`).changes;
+    WHERE (owner_id LIKE 'guest:%' AND datetime(created_at) < datetime('now', ?))
+       OR (owner_id IS NOT NULL AND owner_id NOT LIKE 'guest:%' AND datetime(created_at) < datetime('now', ?))
+  `).run(`-${guestRetentionHours} hours`, `-${userRetentionDays} days`).changes;
   if (deleted) db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
@@ -165,7 +165,8 @@ let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
     const executablePath = resolveBrowserPath();
-    browserPromise = chromium.launch({ executablePath, headless: true }).catch((cause) => {
+    const args = process.env.CHROME_NO_SANDBOX === "true" ? ["--no-sandbox"] : [];
+    browserPromise = chromium.launch({ executablePath, headless: true, args }).catch((cause) => {
       browserPromise = null;
       throw Object.assign(new Error("PDF creation is unavailable. Install Chromium or Chrome, or set CHROME_PATH to its executable."), {
         status: 503, code: "pdf_browser_unavailable", cause
@@ -178,9 +179,9 @@ async function getBrowser() {
 const server = createServer((request, response) => {
   for (const [name, value] of Object.entries(securityHeaders)) response.setHeader(name, value);
   const pathname = new URL(request.url || "/", "http://localhost").pathname;
-  const ownerId = pathname.startsWith("/api/") && pathname !== "/api/health"
-    ? getOrCreateGuestOwner(request, response)
-    : null;
+  const ownerId = pathname === "/health" || pathname === "/api/health"
+    ? null
+    : getOrCreateGuestOwner(request, response);
   if (pathname.startsWith("/api/") && pathname !== "/api/health" && !checkRateLimit(request, pathname, response)) return;
   handle(request, response, ownerId).catch((error) => {
     if (response.headersSent) return response.destroy(error);
@@ -203,7 +204,7 @@ async function handle(req, res, ownerId) {
   const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
   const p = url.pathname;
   if (req.method === "GET" && p === "/health") return json(res, 200, { status: "ok" });
-  if (req.method === "GET" && p === "/api/health") return json(res, 200, { status: "ok", build: BUILD_VERSION });
+  if (req.method === "GET" && p === "/api/health") return json(res, 200, { status: "ok" });
 
   const translation = p.match(/^\/api\/translations\/(en|ur)$/);
   if (req.method === "GET" && translation) {
@@ -359,6 +360,12 @@ function json(res, status, value) {
 }
 
 function publicError(error) {
+  if (process.env.NODE_ENV === "production" && error.code === "pdf_browser_unavailable") {
+    return { status: 503, code: error.code, message: error.message };
+  }
+  if (process.env.NODE_ENV === "production" && (!error.status || error.status >= 500)) {
+    return { status: error.status || 500, code: error.code || "server_error", message: "The server could not complete this request." };
+  }
   if (error.code === "SQLITE_FULL" || error.code === "ENOSPC") {
     return { status: 507, code: "storage_full", message: "The server is out of disk space. Free space on the server drive and try again." };
   }
@@ -367,9 +374,6 @@ function publicError(error) {
   }
   if (error.code === "SQLITE_BUSY" || error.code === "SQLITE_LOCKED") {
     return { status: 503, code: "database_busy", message: "The report database is busy. Wait a moment and try again." };
-  }
-  if (process.env.NODE_ENV === "production" && (!error.status || error.status >= 500)) {
-    return { status: error.status || 500, code: error.code || "server_error", message: "The server could not complete this request." };
   }
   return {
     status: error.status || 500,
