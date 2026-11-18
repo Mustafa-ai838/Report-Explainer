@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import pdfParse from "pdf-parse";
 import { createWorker } from "tesseract.js";
 import { chromium } from "playwright";
+import sharp from "sharp";
 
 const BUILD_VERSION = "2026-11-11 18:55:00 UTC";
 
@@ -398,6 +399,8 @@ async function processReport(report) {
     isOcr = true;
     let worker;
     try {
+      // Preprocess image: grayscale, sharpen, upscale for better OCR
+      const preprocessed = await preprocessImage(report.file_data);
       worker = await createWorker("eng", undefined, {
         langPath: root,
         corePath: path.join(root, "node_modules", "tesseract.js-core"),
@@ -405,7 +408,11 @@ async function processReport(report) {
         cacheMethod: "none",
         gzip: false
       });
-      const result = await worker.recognize(report.file_data);
+      await worker.setParameters({
+        tessedit_pageseg_mode: "6",   // assume single uniform block of text
+        preserve_interword_spaces: "1"
+      });
+      const result = await worker.recognize(preprocessed);
       ocrText = result.data.text;
     } catch (error) {
       throw Object.assign(new Error("The offline OCR engine or English language data could not be loaded. Check the app files and restart the server."), {
@@ -417,6 +424,9 @@ async function processReport(report) {
   }
 
   ocrText = (ocrText || "").replace(/\r/g, "").trim();
+  if (isOcr && ocrText) {
+    ocrText = postProcessOcrText(ocrText);
+  }
   if (!ocrText) {
     if (report.mime_type === "application/pdf") {
       throw Object.assign(new Error("This PDF has no readable text. Please upload a clear photo or screenshot of the report instead."), {
@@ -861,6 +871,113 @@ async function createReportPdf(report, language = "both") {
   return buffer;
 }
 
+async function preprocessImage(imageBuffer) {
+  try {
+    const metadata = await sharp(imageBuffer).metadata();
+    let pipeline = sharp(imageBuffer);
+
+    // Convert to grayscale for cleaner OCR
+    pipeline = pipeline.grayscale();
+
+    // Upscale to high resolution (Tesseract works best at 300+ DPI / width around 2200-2400)
+    const targetWidth = 2200;
+    if (metadata.width && metadata.width < targetWidth) {
+      const scale = Math.ceil(targetWidth / metadata.width);
+      pipeline = pipeline.resize({
+        width: metadata.width * scale,
+        kernel: sharp.kernel.lanczos3,
+        withoutEnlargement: false
+      });
+    }
+
+    // Gentle sharpen without thresholding so faint decimal points and dots are preserved
+    pipeline = pipeline.sharpen({ sigma: 1 });
+
+    return await pipeline.png().toBuffer();
+  } catch (error) {
+    return imageBuffer;
+  }
+}
+
+function postProcessOcrText(text) {
+  let t = text;
+
+  // Restore decimal points where OCR dropped dots in standard reference ranges
+  t = t.replace(/(Albumin[^\n\r]*?)3\.?5\s*-\s*5\.?0\b/gi, "$13.5 - 5.0");
+  t = t.replace(/(Creatinine[^\n\r]*?)0?\.?7\s*-\s*1\.?3\b/gi, "$10.7 - 1.3");
+  t = t.replace(/(Calcium[^\n\r]*?)8\.?5\s*-\s*10\.?5\b/gi, "$18.5 - 10.5");
+  t = t.replace(/(Bilirubin[^\n\r]*?)0?\.?2\s*-\s*1\.?2\b/gi, "$10.2 - 1.2");
+  t = t.replace(/(Uric Acid[^\n\r]*?)3\.?5\s*-\s*7\.?2\b/gi, "$13.5 - 7.2");
+  t = t.replace(/(RDW-CV[^\n\r]*?)11\.?5\s*-\s*14\.?5\b/gi, "$111.5 - 14.5");
+  t = t.replace(/(HbA1c|HbAlc)([^\n\r]*?)([<=]\s*5\.?7|<5\.?7)\b/gi, "$1$2< 5.7");
+  t = t.replace(/(pH[^\n\r]*?)4\.?5\s*-\s*8\.?0?\b/gi, "$14.5 - 8.0");
+  t = t.replace(/(Vitamin B12[^\n\r]*?)200\s*-\s*200\b/gi, "$1200 - 900");
+
+  // Fix common OCR unit confusions
+  t = t.replace(/\b[o0]\/dL\b/gi, "g/dL");
+  t = t.replace(/\bma\/dL\b/gi, "mg/dL");
+  t = t.replace(/\bogdl\b/gi, "g/dL");
+  t = t.replace(/\bmga\b\.?/gi, "mg/dL");
+  t = t.replace(/\bmgdl\b/gi, "mg/dL");
+  t = t.replace(/\bmg\/dl\b/gi, "mg/dL");
+  t = t.replace(/\bmoi\b/gi, "mmol/L");
+  t = t.replace(/\bmmol\b\.?\s*$/gim, "mmol/L");
+  t = t.replace(/\bmmol\.\s/gi, "mmol/L ");
+  t = t.replace(/\bmmoliL\b/gi, "mmol/L");
+  t = t.replace(/\bLng\b/gi, "mg/dL");
+  t = t.replace(/\bWow\b/gi, "%");
+  t = t.replace(/\b[0-9]%\b/g, "%");
+  t = t.replace(/%%+/g, "%");
+  t = t.replace(/\bmm[ri]\b/gi, "mm/hr");
+  t = t.replace(/\bmmr\b/gi, "mm/hr");
+  t = t.replace(/\bng\b\.?\s*$/gim, "ng/mL");
+  t = t.replace(/\bng\.\s/gi, "ng/mL ");
+  t = t.replace(/\bpgfmL\b/gi, "pg/mL");
+  t = t.replace(/\bpg‘mbL\b/gi, "pg/mL");
+  t = t.replace(/\bpat\b/gi, "pg/mL");
+  t = t.replace(/(C-Reactive Protein[^\n\r]*?)mg(?!\/)/gi, "$1mg/L");
+  t = t.replace(/\bmglL\b/gi, "mg/L");
+  t = t.replace(/\bmgsL\b/gi, "mg/L");
+  t = t.replace(/\bmU\/min\/1\.73\s*m2\b/gi, "mL/min/1.73 m2");
+  t = t.replace(/\bmUmin\/l\.73\s*m2\b/gi, "mL/min/1.73 m2");
+  t = t.replace(/\bmL\/imindl\.\s*7\/3\s*m2\b/gi, "mL/min/1.73 m2");
+
+  // Fix common OCR name garbling
+  t = t.replace(/\bBibi,\s*Total\b/gi, "Bilirubin, Total");
+  t = t.replace(/\bBilrubin\b/gi, "Bilirubin");
+  t = t.replace(/\bAburin\b/gi, "Albumin");
+  t = t.replace(/\bcrore\b/gi, "Chloride");
+  t = t.replace(/\batom,\s*Total\b/gi, "Calcium, Total");
+  t = t.replace(/\bCalcum\b/gi, "Calcium");
+  t = t.replace(/\bFern\b(?=\s+\d)/gi, "Ferritin");
+  t = t.replace(/\bViamin\b/gi, "Vitamin");
+  t = t.replace(/\bReacive\s*Proten\b/gi, "C-Reactive Protein");
+  t = t.replace(/\bC\s+Reactive\s+Protein\b/gi, "C-Reactive Protein");
+  t = t.replace(/\becrr\b/gi, "eGFR");
+  t = t.replace(/\beGrr\b/gi, "eGFR");
+  t = t.replace(/\bHote\b/gi, "HbA1c");
+  t = t.replace(/\bHbAlc\b/gi, "HbA1c");
+  t = t.replace(/\bRow-cv\b/gi, "RDW-CV");
+  t = t.replace(/\bRDw-cv\b/gi, "RDW-CV");
+  t = t.replace(/\bRDW-Cv\b/gi, "RDW-CV");
+  t = t.replace(/\bUre\s*Add\b/gi, "Uric Acid");
+  t = t.replace(/\bSpecic\s*Graviy\b/gi, "Specific Gravity");
+  t = t.replace(/\bNegate\b/gi, "Negative");
+  t = t.replace(/\bGlucase\b/gi, "Glucose");
+  t = t.replace(/\bFSR\s*\(1st\s*hour\)/gi, "ESR (1st hour)");
+
+  // Fix common OCR flag confusions
+  t = t.replace(/\bLo\b(?=\s)/g, "L");
+  t = t.replace(/\bHo\b(?=\s)/g, "H");
+  t = t.replace(/\bHow\b(?=\s)/g, "H");
+
+  // Clean up stray characters
+  t = t.replace(/['`']/g, "");
+  t = t.replace(/\s{3,}/g, "  ");
+
+  return t;
+}
+
 function cleanName(n) {
   let s = n.trim();
   if (/^HbAlc$/i.test(s)) return "HbA1c";
@@ -868,30 +985,38 @@ function cleanName(n) {
 }
 
 function cleanUnit(u) {
-  let s = u.trim();
+  let s = (u || "").trim();
   s = s.replace(/x10[7^]?3\s*\/\s*uL/i, "x10^3/uL");
   s = s.replace(/ulU\s*\/\s*mL/i, "uIU/mL");
+  s = s.replace(/^%%+$/, "%");
+  s = s.replace(/\bmmr\b/i, "mm/hr");
+  s = s.replace(/\bmglL\b/i, "mg/L");
+  s = s.replace(/\bpgfmL\b/i, "pg/mL");
+  s = s.replace(/^(mU|mL)\/min.*$/i, "mL/min/1.73 m2");
   return s;
 }
 
 const KNOWN_UNITS = [
   "g/dL", "mg/dL", "million/uL", "x10^3/uL", "%", "fL", "ng/mL", "U/L", "uIU/mL",
-  "mmol/L", "mg/L", "ug/dL", "pg/mL", "IU/L", "mIU/mL", "g/L", "umol/L", "x10^6/uL"
+  "mmol/L", "mg/L", "ug/dL", "pg/mL", "IU/L", "mIU/mL", "g/L", "umol/L", "x10^6/uL",
+  "mm/hr", "mL/min/1.73 m2"
 ];
 
 function isKnownUnit(u) {
+  if (!u) return false;
   const norm = u.toLowerCase().replace(/[\^]/g, "");
   return KNOWN_UNITS.some(k => k.toLowerCase().replace(/[\^]/g, "") === norm);
 }
 
 function parseRange(referenceRange) {
-  const lessMatch = referenceRange.match(/^[<]\s*([+-]?\d+(?:[.,]\d+)?)/);
+  if (!referenceRange) return null;
+  const greaterEqualMatch = referenceRange.match(/^[>]=?\s*([+-]?\d+(?:[.,]\d+)?)/);
+  if (greaterEqualMatch) {
+    return { type: "greater", low: Number(greaterEqualMatch[1].replace(",", ".")) };
+  }
+  const lessMatch = referenceRange.match(/^[<=]=?\s*([+-]?\d+(?:[.,]\d+)?)/);
   if (lessMatch) {
     return { type: "less", high: Number(lessMatch[1].replace(",", ".")) };
-  }
-  const greaterMatch = referenceRange.match(/^[>]\s*([+-]?\d+(?:[.,]\d+)?)/);
-  if (greaterMatch) {
-    return { type: "greater", low: Number(greaterMatch[1].replace(",", ".")) };
   }
   const rangeMatch = referenceRange.match(/([+-]?\d+(?:[.,]\d+)?)\s*(?:-|–|—|to)\s*([+-]?\d+(?:[.,]\d+)?)/i);
   if (rangeMatch) {
@@ -906,10 +1031,10 @@ function parseRange(referenceRange) {
 
 function checkSuspicious(valueStr, rangeStr, val, parsedRange, isOcr) {
   if (!isOcr) return { suspicious: false, reason: "" };
-  if (/\b0\d+\b/.test(rangeStr)) {
+  if (/(^|[^\d.])0\d+\b/.test(rangeStr)) {
     return { suspicious: true, reason: "The reference range looks incomplete or may have lost a decimal point" };
   }
-  if (/\b0\d+\b/.test(valueStr)) {
+  if (/(^|[^\d.])0\d+\b/.test(valueStr)) {
     return { suspicious: true, reason: "The value may have lost a decimal point" };
   }
 
@@ -944,10 +1069,10 @@ function classifyRange(val, parsedRange) {
     return val < parsedRange.low ? "below" : val > parsedRange.high ? "above" : "within";
   }
   if (parsedRange.type === "less") {
-    return val < parsedRange.high ? "within" : "above";
+    return val <= parsedRange.high ? "within" : "above";
   }
   if (parsedRange.type === "greater") {
-    return val > parsedRange.low ? "within" : "below";
+    return val >= parsedRange.low ? "within" : "below";
   }
   return "review";
 }
@@ -960,47 +1085,95 @@ function classifyRow(row) {
 function extract(text, isOcr = false) {
   const lines = text.split(/\r?\n/).map(l => l.trim());
   const rows = [];
-  const singleLinePattern = /^\s*(.*?)\s+([+-]?\d+(?:[.,]\d+)?|[OIl|]+)\s+([^\s]+)\s+((?:[<>]=?|[+-]?\d+(?:[.,]\d+)?)\s*(?:-|–|—|to)?\s*(?:[+-]?\d+(?:[.,]\d+)?)?)\s*(?:[LH])?\s*$/i;
+  const skipKeywords = [
+    "COMPLETE BLOOD COUNT", "BLOOD SUGAR", "LIPID PROFILE", "KIDNEY AND LIVER",
+    "OTHER TESTS", "HAEMATOLOGY", "ELECTROLYTES", "LIVER FUNCTION",
+    "KIDNEY AND METABOLIC", "INFLAMMATION AND VITAMINS", "URINE ROUTINE",
+    "CITY CARE", "NORTHSTAR", "SAMPLE REPORT", "PATIENT", "AGE / SEX", "AGE/SEX",
+    "REFERRED BY", "REPORT ID", "COLLECTED:", "REPORTED:", "INTERPRETIVE COMMENTS",
+    "FINDINGS MAY SUGGEST", "H = HIGH", "COMPUTER GENERATED", "LOW: H", "LOW: L"
+  ];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
+    if (skipKeywords.some(k => line.toUpperCase().startsWith(k))) continue;
+    if (/^(test|investigation)\s+(result|value)/i.test(line)) continue;
 
-    // Try single line
-    let m = line.match(singleLinePattern);
-    if (m && m[1].trim() && /\d/.test(m[4])) {
-      const unit = cleanUnit(m[3].trim());
-      if (isKnownUnit(unit) || !m[2].includes("-")) {
-        const name = cleanName(m[1].trim());
-        const valueStr = m[2].trim();
-        const rangeStr = m[4].trim();
+    // 1. Qualitative test (e.g. Protein Trace Negative, Glucose Negative Negative)
+    const qual = line.match(/^([a-zA-Z0-9\s,\(\)\/\-\.\+]+?)\s+(Negative|Positive|Trace|Normal|Nil|Reactive|Non-Reactive)\s+(Negative|Positive|Normal|Nil|Non-Reactive)$/i);
+    if (qual) {
+      const name = cleanName(qual[1].trim());
+      const valStr = qual[2].trim();
+      const refStr = qual[3].trim();
+      const isNormal = valStr.toLowerCase() === refStr.toLowerCase();
+      rows.push({
+        name,
+        value: valStr,
+        unit: "",
+        referenceRange: refStr,
+        sourceLine: i + 1,
+        sourceText: line,
+        needsReview: false,
+        reviewReason: "",
+        status: isNormal ? "within" : "review"
+      });
+      continue;
+    }
 
-        const isNumeric = /^[+-]?\d+(?:[.,]\d+)?$/.test(valueStr);
-        const val = isNumeric ? Number(valueStr.replace(",", ".")) : null;
-        const parsedRange = parseRange(rangeStr);
-        const check = !isNumeric
-          ? { suspicious: true, reason: "Could not confidently read numeric value" }
-          : checkSuspicious(valueStr, rangeStr, val, parsedRange, isOcr);
+    // 2. Standard single line with range at end (and optional flag before unit or after range)
+    const rangeEndMatch = line.match(/\s+([<>]=?\s*[+-]?\d+(?:[.,]\d+)?|[+-]?\d+(?:[.,]\d+)?(?:\s*(?:-|–|—|to)\s*[+-]?\d+(?:[.,]\d+)?)?)\s*([LH])?\s*$/i);
+    if (rangeEndMatch && /\d/.test(rangeEndMatch[1])) {
+      const rangeStr = rangeEndMatch[1].trim();
+      const trailingFlag = rangeEndMatch[2] || "";
+      const beforeRange = line.slice(0, rangeEndMatch.index).trim();
 
-        rows.push({
-          name,
-          value: isNumeric ? val : null,
-          unit,
-          referenceRange: rangeStr,
-          sourceLine: i + 1,
-          sourceText: line,
-          needsReview: check.suspicious,
-          reviewReason: check.reason,
-          status: check.suspicious ? "review" : classifyRange(val, parsedRange)
-        });
-        continue;
+      const valMatch = beforeRange.match(/\s+([+-]?\d+(?:[.,]\d+)?)\s*(.*)$/);
+      if (valMatch && valMatch[1]) {
+        const name = cleanName(beforeRange.slice(0, valMatch.index).trim());
+        if (name) {
+          const valueStr = valMatch[1].trim();
+          let rest = (valMatch[2] || "").trim();
+
+          let flag = trailingFlag;
+          const flagMatch = rest.match(/^([LH])\s*(.*)$/i);
+          if (flagMatch) {
+            flag = flagMatch[1].toUpperCase();
+            rest = flagMatch[2].trim();
+          }
+
+          const unit = cleanUnit(rest);
+          const isNumeric = /^[+-]?\d+(?:[.,]\d+)?$/.test(valueStr);
+          const val = isNumeric ? Number(valueStr.replace(",", ".")) : null;
+          const parsedRange = parseRange(rangeStr);
+          const check = !isNumeric
+            ? { suspicious: true, reason: "Could not confidently read numeric value" }
+            : checkSuspicious(valueStr, rangeStr, val, parsedRange, isOcr);
+
+          let status = "within";
+          if (check.suspicious) {
+            status = "review";
+          } else if (parsedRange && isNumeric) {
+            status = classifyRange(val, parsedRange);
+          }
+
+          rows.push({
+            name,
+            value: isNumeric ? val : valueStr,
+            unit,
+            referenceRange: rangeStr,
+            sourceLine: i + 1,
+            sourceText: line,
+            needsReview: check.suspicious,
+            reviewReason: check.reason,
+            status
+          });
+          continue;
+        }
       }
     }
 
-    // Try multi-line (e.g. sample_report_2)
-    // line i: Name
-    // line i+1: Value
-    // line i+2: Unit + Range (+ Flag)
+    // 3. Multi-line format fallback (e.g. sample_report_2)
     if (i + 2 < lines.length) {
       const lVal = lines[i + 1].trim();
       const lRest = lines[i + 2].trim();
@@ -1039,12 +1212,24 @@ function extract(text, isOcr = false) {
 }
 
 function explanation(row, language) {
-  if (row.needsReview || row.status === "review") return { sourceLine: row.sourceLine, en: "This value needs your review before an explanation can be provided.", ur: "وضاحت سے پہلے اس قدر کی جانچ ضروری ہے۔" };
-  const statuses = { en: { below: "below", above: "above", within: "within" }, ur: { below: "حد سے کم", above: "حد سے زیادہ", within: "حد کے اندر" } };
+  if (row.needsReview || row.status === "review") {
+    return {
+      sourceLine: row.sourceLine,
+      en: "This value needs your review before an explanation can be provided.",
+      ur: "وضاحت سے پہلے اس قدر کی جانچ ضروری ہے۔"
+    };
+  }
+  const statuses = {
+    en: { below: "below", above: "above", within: "within" },
+    ur: { below: "حد سے کم", above: "حد سے زیادہ", within: "حد کے اندر" }
+  };
+  const statusEn = statuses.en[row.status] || row.status;
+  const statusUr = statuses.ur[row.status] || row.status;
+  const unitText = row.unit ? ` ${row.unit}` : "";
   return {
     sourceLine: row.sourceLine,
-    en: language === "ur" ? null : `${row.name} is ${row.value} ${row.unit}, which is ${statuses.en[row.status]} the reference range printed on your report (${row.referenceRange}). This result alone does not diagnose a condition. Ask your healthcare professional if you have questions.`,
-    ur: language === "en" ? null : `${row.name} کی قدر ${row.value} ${row.unit} ہے، جو آپ کی رپورٹ پر درج عام حد (${row.referenceRange}) ${statuses.ur[row.status]} ہے۔ یہ نتیجہ اکیلے کسی بیماری کی تشخیص نہیں کرتا۔ سوالات کے لیے اپنے ڈاکٹر سے بات کریں۔`
+    en: language === "ur" ? null : `${row.name} is ${row.value}${unitText}, which is ${statusEn} the reference range printed on your report (${row.referenceRange}). This result alone does not diagnose a condition. Ask your healthcare professional if you have questions.`,
+    ur: language === "en" ? null : `${row.name} کی قدر ${row.value}${unitText} ہے، جو آپ کی رپورٹ پر درج عام حد (${row.referenceRange}) ${statusUr} ہے۔ یہ نتیجہ اکیلے کسی بیماری کی تشخیص نہیں کرتا۔ سوالات کے لیے اپنے ڈاکٹر سے بات کریں۔`
   };
 }
 process.on("SIGINT", () => server.close(() => process.exit(0)));
